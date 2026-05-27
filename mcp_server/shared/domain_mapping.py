@@ -16,6 +16,7 @@ Pure business logic — uses subprocess only for `git remote get-url origin`.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -260,10 +261,29 @@ class DomainRegistry:
         self.path_to_repo = {r.fs_path: r for r in self.repos}
 
 
+def _resolve_dev_root() -> Path:
+    """Resolve the development root.
+
+    CORTEX_DEV_ROOT env var wins (consistent with http_launcher.py /
+    visualize_bootstrap.py / open_visualization.py). Falls back to
+    ~/Developments for the upstream default. Required for Docker
+    deployments where the host's project tree is bind-mounted at a
+    container-specific path (e.g. /host).
+    """
+    env = os.environ.get("CORTEX_DEV_ROOT", "").strip()
+    if env:
+        return Path(env)
+    return Path.home() / "Developments"
+
+
 @lru_cache(maxsize=1)
 def _build_registry() -> DomainRegistry:
-    """Build the complete domain registry from git repos. Cached at startup."""
-    dev_root = Path.home() / "Developments"
+    """Build the complete domain registry from git repos. Cached at startup.
+
+    Note: env vars (`CORTEX_DEV_ROOT`) are read here once. Tests that
+    mutate the environment must call `_build_registry.cache_clear()`.
+    """
+    dev_root = _resolve_dev_root()
     repos = _discover_repos(dev_root)
     name_to_canonical = _group_repos(repos)
     slug_index = _build_slug_index(repos)
@@ -348,6 +368,45 @@ def resolve_domain(input_str: str) -> str:
     return lower
 
 
+def _normalize_path(p: str) -> str:
+    """Normalize a path for prefix comparison: backslashes → forward,
+    collapse repeated separators, strip trailing separator."""
+    if not p:
+        return p
+    norm = p.replace("\\", "/")
+    while "//" in norm:
+        norm = norm.replace("//", "/")
+    return norm.rstrip("/")
+
+
+def _to_container_path(cwd: str) -> str:
+    """Translate a host-side cwd (possibly a Windows path) to a path
+    visible inside the runtime, using CORTEX_HOST_HOME → CORTEX_DEV_ROOT.
+
+    Returns cwd unchanged when no translation is configured or applies.
+
+    Case behavior: the prefix test is case-insensitive so a Windows cwd
+    whose drive letter or directory case differs from the configured
+    host_home still matches. The tail is spliced using the cwd's own
+    casing — downstream comparisons against `registry.repos` should
+    also be case-insensitive on Windows-backed mounts (see resolve_cwd).
+    """
+    if not cwd:
+        return cwd
+    dev_root = os.environ.get("CORTEX_DEV_ROOT", "").strip()
+    host_home = os.environ.get("CORTEX_HOST_HOME", "").strip()
+    if not dev_root or not host_home:
+        return cwd
+    norm = _normalize_path(cwd)
+    home_norm = _normalize_path(host_home)
+    if norm.lower() == home_norm.lower():
+        return _normalize_path(dev_root)
+    if norm.lower().startswith(home_norm.lower() + "/"):
+        tail = norm[len(home_norm) + 1:]
+        return f"{_normalize_path(dev_root)}/{tail}"
+    return cwd
+
+
 def resolve_cwd(cwd: str) -> str:
     """Resolve a working directory to a canonical domain.
 
@@ -356,18 +415,32 @@ def resolve_cwd(cwd: str) -> str:
 
     Returns '' if the cwd does not belong to a *known* repo — callers
     rely on empty-string to fall through to explicit domain hints.
+
+    The prefix-match fallback compares case-insensitively so Windows
+    host-path translation (which preserves caller casing) still matches
+    the registry's canonical repo paths.
     """
     if not cwd:
         return ""
-    root = _git_root(cwd)
+    container_cwd = _to_container_path(cwd)
+    root = _git_root(container_cwd)
+    registry = _build_registry()
     if root:
-        registry = _build_registry()
         repo = registry.path_to_repo.get(root)
         if repo:
             return repo.canonical
-    # If not in a known git repo, return '' so callers can fall through
-    # to explicit domain hints.  The old behaviour delegated to
-    # resolve_domain(cwd) which *always* returns non-empty (it falls
-    # back to the lowercased input), silently overriding any explicit
-    # domain the caller intended to use.
+    # Prefix-match fallback — normalize separators + case before
+    # comparison so Windows-native paths from registry.repos match
+    # forward-slash container paths produced by _to_container_path.
+    norm_cwd = _normalize_path(container_cwd).lower()
+    candidates = [
+        repo for repo in registry.repos
+        if (
+            norm_cwd == _normalize_path(repo.fs_path).lower()
+            or norm_cwd.startswith(_normalize_path(repo.fs_path).lower() + "/")
+        )
+    ]
+    if candidates:
+        # Longest-prefix wins so nested repos resolve to the inner one.
+        return max(candidates, key=lambda r: len(r.fs_path)).canonical
     return ""
