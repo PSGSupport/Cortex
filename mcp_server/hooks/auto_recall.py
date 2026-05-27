@@ -25,7 +25,7 @@ Source backing:
 
 Strategy:
   1. Receive user message text from stdin JSON
-  2. Run fast PG query: FTS match + heat filter (no embedding load)
+  2. Run fast PG query: FTS match + heat_base filter (no embedding load)
   3. If relevant memories found, format as compact context block
   4. Exit 0 → stdout injected into Claude's context
   5. If nothing found, exit 1 → no injection, no noise
@@ -122,7 +122,7 @@ def _recall_memories(query: str) -> list[dict]:
     """Fast FTS-based recall against PG. No embedding model needed.
 
     Uses plainto_tsquery for natural language matching against the
-    content_tsv tsvector column. Combined with heat filter to surface
+    content_tsv tsvector column. Combined with heat_base filter to surface
     important memories.
 
     Falls back to ILIKE if FTS returns nothing (handles short queries
@@ -141,18 +141,18 @@ def _recall_memories(query: str) -> list[dict]:
 
     results = []
 
-    # Pass 1: FTS match with heat filter
+    # Pass 1: FTS match with heat_base filter
     try:
         rows = conn.execute(
             """
-            SELECT id, content, heat, domain, agent_context, is_protected,
+            SELECT id, content, heat_base, domain, agent_context, is_protected,
                    ts_rank_cd(content_tsv, q) AS rank
             FROM memories,
                  plainto_tsquery('english', %s) q
             WHERE content_tsv @@ q
-              AND heat >= %s
+              AND heat_base >= %s
               AND NOT is_benchmark
-            ORDER BY is_protected DESC, rank DESC, heat DESC
+            ORDER BY is_protected DESC, rank DESC, heat_base DESC
             LIMIT %s
             """,
             (query[:200], _MIN_HEAT, _MAX_MEMORIES + 2),
@@ -162,7 +162,7 @@ def _recall_memories(query: str) -> list[dict]:
             results.append(
                 {
                     "content": r.get("content", ""),
-                    "heat": r.get("heat", 0),
+                    "heat_base": r.get("heat_base", 0),
                     "domain": r.get("domain", ""),
                     "agent": r.get("agent_context", ""),
                     "protected": bool(r.get("is_protected")),
