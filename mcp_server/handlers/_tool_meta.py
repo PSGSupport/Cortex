@@ -80,11 +80,14 @@ def tool_kwargs(schema: dict[str, Any]) -> dict[str, Any]:
         out["description"] = schema["description"]
     if "title" in schema:
         out["title"] = schema["title"]
-    # Support both ``output_schema`` (snake) and ``outputSchema`` (camel).
-    if "output_schema" in schema:
-        out["output_schema"] = schema["output_schema"]
-    elif "outputSchema" in schema:
-        out["output_schema"] = schema["outputSchema"]
+    # output_schema passthrough is intentionally disabled. Every tool returns
+    # a JSON *string* (safe_handler -> json.dumps), but FastMCP, when a tool
+    # declares an output_schema, requires a dict to populate structured_content
+    # and otherwise raises "structured_content must be a dict or None. Got str".
+    # The 27 tools without output_schema work fine; the 6 that declared it
+    # (recall, remember, get_telemetry, record_session_end, explore_features,
+    # checkpoint) were the only ones erroring. Dropping the passthrough aligns
+    # the declared interface with the actual string return. See cdeust/Cortex#17.
     if "annotations" in schema:
         out["annotations"] = schema["annotations"]
     if "tags" in schema:
