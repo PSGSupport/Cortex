@@ -1,0 +1,73 @@
+# PSG-slim Cortex image — MCP-only, external Postgres.
+#
+# Built against the fork's source. Connects to an existing Postgres
+# container (e.g. mcp-postgres in the docker-compose project) via
+# DATABASE_URL. Pre-caches the all-MiniLM-L6-v2 embedding model and
+# installs git so domain_mapping can git-rev-parse against bind-mounted
+# host repos.
+#
+# Differs from upstream `docker/Dockerfile`:
+#   - No bundled PostgreSQL (upstream's is self-contained; ours uses the
+#     shared mcp-postgres container).
+#   - No Claude Code CLI inside (Claude Code runs on the host and attaches
+#     via stdio).
+#   - ENTRYPOINT is `python -m mcp_server` (upstream's `neuro-cortex-memory`
+#     console script isn't registered as of 3.14.5).
+#   - Adds [codebase] extras + sentence-transformers + flashrank so recall
+#     and seed_project work (upstream slim install only adds [postgresql]).
+#   - Installs git + sets safe.directory '*' so resolve_cwd can walk
+#     read-only bind mounts owned by other UIDs.
+#   - python:3.12-slim-bookworm for tree-sitter-language-pack wheel coverage.
+
+FROM python:3.12-slim-bookworm AS builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY . .
+
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir ".[postgresql,codebase]" \
+    && pip install --no-cache-dir sentence-transformers flashrank
+
+RUN python3 -c "from sentence_transformers import SentenceTransformer; \
+    SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
+
+# ── Runtime ──────────────────────────────────────────────────────────────
+
+FROM python:3.12-slim-bookworm
+
+LABEL org.opencontainers.image.description="Cortex MCP server (PSG slim, external Postgres)"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libpq5 git \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 cortex \
+    && git config --system --add safe.directory '*'
+
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+COPY --from=builder --chown=cortex:cortex /root/.cache/huggingface /home/cortex/.cache/huggingface
+COPY --from=builder --chown=cortex:cortex /build /opt/cortex
+
+# Pre-create bind-mount targets as cortex-owned. Without this, Docker auto-creates
+# /home/cortex/.claude as root:root when mounting :/home/cortex/.claude/projects:ro,
+# which then prevents the cortex user from writing methodology/profiles.json.
+RUN mkdir -p /home/cortex/.claude/projects /home/cortex/.claude/methodology /host \
+    && chown -R cortex:cortex /home/cortex/.claude
+
+USER cortex
+WORKDIR /home/cortex
+
+ENV PYTHONPATH=/opt/cortex
+ENV CORTEX_MEMORY_STORE_BACKEND=postgresql
+
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+    CMD python -c "from mcp_server.infrastructure.memory_config import get_memory_settings; get_memory_settings()"
+
+ENTRYPOINT ["python", "-m", "mcp_server"]
